@@ -24,7 +24,18 @@ if 'rag_pipeline' not in st.session_state:
 
 # App title and description
 st.title("📚 RAG PDF Assistant")
-st.markdown("Upload PDFs, ask questions, and get intelligent answers with visual context!")
+st.markdown("Upload PDFs, ask questions, and get intelligent answers with **hybrid search** and visual context!")
+
+# Add info about hybrid search
+with st.expander("ℹ️ About Hybrid Search"):
+    st.markdown("""
+    This RAG system uses **hybrid search** combining:
+    - **BM25 (Sparse Retrieval)**: Excellent for keyword matching and exact terms
+    - **Vector Search (Dense Retrieval)**: Great for semantic similarity and context understanding
+    - **Cross-encoder Reranking**: Final reranking for optimal relevance
+    
+    The ensemble approach provides more comprehensive and accurate results!
+    """)
 
 # Sidebar for PDF management
 with st.sidebar:
@@ -132,11 +143,11 @@ with col1:
     )
     
     # Search configuration
-    with st.expander("🔧 Search Settings"):
+    with st.expander("🔧 Hybrid Search Settings"):
         col_a, col_b = st.columns(2)
         with col_a:
-            num_results = st.slider("Documents to retrieve", 1, 10, 3)
-            num_docs_for_answer = st.slider("Documents for answer", 1, 5, 2)
+            num_results = st.slider("Documents to retrieve", 1, 10, 5, help="More documents = broader search scope")
+            num_docs_for_answer = st.slider("Documents for answer", 1, 5, 2, help="Documents used to generate the final answer")
         
         with col_b:
             # PDF filter option
@@ -147,14 +158,17 @@ with col1:
                 help="Choose a specific PDF to search in, or select 'All PDFs'"
             )
             pdf_filter = None if selected_pdf == "All PDFs" else selected_pdf
+            
+            # Show search method info
+            st.info("🔄 **Hybrid Search**: BM25 (60%) + Vector (40%) + Cross-encoder reranking")
     
     # Search and generate answer
-    if st.button("🔍 Search & Answer", type="primary") and query:
+    if st.button("🔍 Hybrid Search & Answer", type="primary") and query:
         if not stored_pdfs:
             st.warning("⚠️ Please upload some PDFs first!")
         else:
-            with st.spinner("Searching and generating answer..."):
-                # Search and rank documents
+            with st.spinner("🔄 Running hybrid search and generating answer..."):
+                # Search and rank documents using hybrid approach
                 ranked_docs = st.session_state.rag_pipeline.search_and_rank(
                     query, num_results, pdf_filter
                 )
@@ -169,51 +183,79 @@ with col1:
                     st.subheader("🎯 Answer")
                     st.write(answer)
                     
+                    # Display search methodology used
+                    search_method = "🔄 **Hybrid Search Used**: BM25 + Vector Search + Cross-encoder Reranking"
+                    if pdf_filter:
+                        search_method += f" (filtered to: {pdf_filter})"
+                    st.caption(search_method)
+                    
                     # Display source information
                     st.subheader("📄 Sources")
                     for i, doc in enumerate(top_docs, 1):
                         with st.expander(f"Source {i} - {doc.metadata.get('pdf_name', 'Unknown')} (Page {doc.metadata.get('page_number', 'Unknown')})"):
-                            st.write(f"**Section:** {doc.metadata.get('section_title', 'N/A')}")
+                            if doc.metadata.get('section_title'):
+                                st.write(f"**Section:** {doc.metadata.get('section_title')}")
                             st.write(f"**Content Preview:**")
-                            st.write(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
+                            preview_text = doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content
+                            st.write(preview_text)
                     
                     # Store results in session state for image display
                     st.session_state.current_docs = top_docs
+                    
+                    # Show retrieval stats
+                    with st.expander("📊 Retrieval Statistics"):
+                        st.write(f"- **Total documents retrieved**: {len(ranked_docs)}")
+                        st.write(f"- **Documents used for answer**: {len(top_docs)}")
+                        st.write(f"- **Search scope**: {'All PDFs' if not pdf_filter else pdf_filter}")
+                        st.write(f"- **Retrieval method**: Hybrid (BM25 + Vector + Reranking)")
                 else:
                     search_scope = f" in {pdf_filter}" if pdf_filter else ""
                     st.warning(f"⚠️ No relevant documents found for your query{search_scope}.")
 
 with col2:
-    st.header("🖼️ Visual Context")
-    
-    # Display images from current search results
-    if hasattr(st.session_state, 'current_docs') and st.session_state.current_docs:
-        image_found = False
-        
-        for i, doc in enumerate(st.session_state.current_docs, 1):
-            image_paths = doc.metadata.get("image_path", "")
-            if image_paths:
-                paths = [p.strip() for p in image_paths.split(",") if p.strip()]
-                for j, path in enumerate(paths):
-                    if os.path.exists(path):
-                        try:
-                            img = Image.open(path)
-                            st.image(
-                                img, 
-                                caption=f"{doc.metadata.get('pdf_name', 'Unknown')} - Image {j+1}",
-                                use_container_width=True  # ✅ Fixed: Changed from use_column_width
-                            )
-                            image_found = True
-                        except Exception as e:
-                            st.error(f"Error loading image: {e}")
-        
-        if not image_found:
-            st.info("No images found in the current search results.")
-    else:
-        st.info("Perform a search to see related images here.")
+   st.header("🖼️ Visual Context")
+   
+   # Display images from current search results
+   if hasattr(st.session_state, 'current_docs') and st.session_state.current_docs:
+       image_found = False
+       
+       for i, doc in enumerate(st.session_state.current_docs, 1):
+           image_paths = doc.metadata.get("image_path", "")
+           if image_paths:
+               # Handle both string and list formats
+               if isinstance(image_paths, str):
+                   paths = [p.strip() for p in image_paths.split(",") if p.strip()]
+               else:
+                   paths = image_paths
+               
+               for j, path in enumerate(paths):
+                   if os.path.exists(path):
+                       try:
+                           img = Image.open(path)
+                           caption = f"{doc.metadata.get('pdf_name', 'Unknown')} - Page {doc.metadata.get('page_number', '?')} - Image {j+1}"
+                           st.image(
+                               img, 
+                               caption=caption,
+                               use_container_width=True
+                           )
+                           image_found = True
+                       except Exception as e:
+                           st.error(f"Error loading image: {e}")
+       
+       if not image_found:
+           st.info("No images found in the current search results.")
+   else:
+       st.info("Perform a hybrid search to see related images here.")
 
 # Footer
 st.markdown("---")
 st.markdown(
-    "💡 **Tip:** The system automatically tracks PDFs by name in the database schema, making deletion and management much more efficient!"
+   """
+   💡 **Enhanced RAG Features:**
+   - 🔄 **Hybrid Search**: Combines BM25 and vector search for optimal results
+   - 🧠 **Cross-encoder Reranking**: Improves relevance scoring
+   - 📊 **PDF Management**: Track and manage multiple documents
+   - 🖼️ **Visual Context**: Automatically extract and display relevant images
+   - ⚙️ **Configurable**: Adjust search parameters for your needs
+   """
 )

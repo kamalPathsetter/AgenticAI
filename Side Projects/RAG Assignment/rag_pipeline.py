@@ -2,7 +2,6 @@ import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-
 import uuid
 import base64
 from collections import Counter
@@ -15,6 +14,8 @@ from langchain.embeddings import OpenAIEmbeddings
 from langchain import hub
 from langchain.chains import LLMChain
 from langchain_community.chat_models import ChatOpenAI
+from langchain.retrievers import BM25Retriever, EnsembleRetriever
+from langchain.schema import Document
 from sentence_transformers import CrossEncoder
 import streamlit as st
 
@@ -29,13 +30,17 @@ class RAGPipeline:
         
         # Initialize components
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+        self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
         self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L6-v2')
         self.prompt = hub.pull("rlm/rag-prompt")
         
         # Connect to Milvus
         self._connect_milvus()
         self._setup_collection()
+        
+        # Initialize BM25 retriever storage
+        self.bm25_documents = []
+        self.sparse_retriever = None
         
         # Create image directory
         os.makedirs(self.image_output_dir, exist_ok=True)
@@ -80,14 +85,13 @@ class RAGPipeline:
             # Rename old collection
             if self.collection_name in list_collections():
                 print("Backing up old collection...")
-                # Note: Milvus doesn't have direct rename, so we'll drop and recreate
                 old_collection = Collection(name=self.collection_name)
                 
                 # Get all data from old collection
                 old_data = []
                 try:
                     results = old_collection.query(
-                        expr="id != ''",  # Get all records
+                        expr="id != ''",
                         output_fields=["*"]
                     )
                     old_data = results
@@ -127,7 +131,7 @@ class RAGPipeline:
             FieldSchema(name="section_title", dtype=DataType.VARCHAR, max_length=256),
             FieldSchema(name="page_number", dtype=DataType.INT64),
             FieldSchema(name="image_path", dtype=DataType.VARCHAR, max_length=1024),
-            FieldSchema(name="pdf_name", dtype=DataType.VARCHAR, max_length=256),  # New field
+            FieldSchema(name="pdf_name", dtype=DataType.VARCHAR, max_length=256),
         ]
         
         schema = CollectionSchema(fields, description="RAG Assignment with PDF tracking")
@@ -141,7 +145,6 @@ class RAGPipeline:
             migrated_docs = []
             
             for record in old_data:
-                # Add default pdf_name for old records
                 migrated_doc = {
                     "id": record.get("id", str(uuid.uuid4())),
                     "embedding": record.get("embedding", [0.0] * 1536),
@@ -150,7 +153,7 @@ class RAGPipeline:
                     "section_title": record.get("section_title", ""),
                     "page_number": record.get("page_number", -1),
                     "image_path": record.get("image_path", ""),
-                    "pdf_name": "legacy_document.pdf",  # Default name for old records
+                    "pdf_name": "legacy_document.pdf",
                 }
                 migrated_docs.append(migrated_doc)
             
@@ -164,14 +167,11 @@ class RAGPipeline:
     def _setup_collection(self):
         """Setup Milvus collection schema with migration support"""
         try:
-            # Check if collection exists and has the right schema
             if self.collection_name in list_collections():
                 if self._has_pdf_name_field():
-                    # Collection exists with correct schema
                     self.collection = Collection(name=self.collection_name)
                     print("Using existing collection with correct schema")
                 else:
-                    # Collection exists but needs migration
                     print("Collection exists but needs schema migration...")
                     if st.session_state.get('migration_confirmed', False) or self._confirm_migration():
                         self._migrate_collection()
@@ -179,10 +179,12 @@ class RAGPipeline:
                         st.error("Migration required but not confirmed. Please restart the app and confirm migration.")
                         st.stop()
             else:
-                # No collection exists, create new one
                 self._create_new_collection()
             
             self.collection.load()
+            
+            # Initialize BM25 retriever with existing documents
+            self._initialize_bm25_retriever()
             
         except Exception as e:
             st.error(f"Error setting up collection: {e}")
@@ -227,6 +229,45 @@ class RAGPipeline:
             "params": {"nlist": 128}
         }
         self.collection.create_index(field_name="embedding", index_params=index_params)
+    
+    def _initialize_bm25_retriever(self):
+        """Initialize BM25 retriever with existing documents"""
+        try:
+            # Get all documents from Milvus for BM25
+            results = self.collection.query(
+                expr="id != ''",
+                output_fields=["id", "content", "type", "section_title", "page_number", "image_path", "pdf_name"]
+            )
+            
+            self.bm25_documents = [
+                Document(
+                    page_content=result["content"],
+                    metadata={
+                        "id": result["id"],
+                        "type": result["type"],
+                        "section_title": result["section_title"],
+                        "page_number": result["page_number"],
+                        "image_path": result["image_path"],
+                        "pdf_name": result["pdf_name"]
+                    }
+                )
+                for result in results
+            ]
+            
+            if self.bm25_documents:
+                self.sparse_retriever = BM25Retriever.from_documents(self.bm25_documents)
+                self.sparse_retriever.k = 3
+                print(f"Initialized BM25 retriever with {len(self.bm25_documents)} documents")
+            else:
+                print("No documents found for BM25 initialization")
+                
+        except Exception as e:
+            print(f"Error initializing BM25 retriever: {e}")
+            self.sparse_retriever = None
+    
+    def _update_bm25_retriever(self):
+        """Update BM25 retriever after new documents are added"""
+        self._initialize_bm25_retriever()
     
     def check_pdf_exists(self, pdf_name):
         """Check if PDF already exists in the database"""
@@ -273,7 +314,6 @@ class RAGPipeline:
     def process_pdf(self, file_path, pdf_name):
         """Process PDF and extract chunks with metadata"""
         try:
-            # Check if PDF already exists
             if self.check_pdf_exists(pdf_name):
                 print(f"PDF {pdf_name} already exists in database")
                 return []
@@ -369,6 +409,9 @@ class RAGPipeline:
             self.collection.insert(data_to_insert)
             self.collection.flush()
             
+            # Update BM25 retriever with new documents
+            self._update_bm25_retriever()
+            
             print(f"Successfully inserted {len(documents)} documents")
             return True
             
@@ -397,6 +440,9 @@ class RAGPipeline:
             expr = f'pdf_name == "{pdf_name}"'
             self.collection.delete(expr)
             self.collection.flush()
+            
+            # Update BM25 retriever after deletion
+            self._update_bm25_retriever()
             
             # Delete image files
             deleted_images = 0
@@ -452,8 +498,9 @@ class RAGPipeline:
             return []
     
     def search_and_rank(self, query, k=3, pdf_filter=None):
-        """Search and rank documents with optional PDF filtering"""
+        """Hybrid search and rank documents using ensemble retriever with optional PDF filtering"""
         try:
+            # Create dense vector retriever
             vector_store = Milvus(
                 embedding_function=self.embeddings,
                 collection_name=self.collection_name,
@@ -467,15 +514,42 @@ class RAGPipeline:
             if pdf_filter:
                 search_kwargs["expr"] = f'pdf_name == "{pdf_filter}"'
             
-            retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
-            top_k_docs = retriever.get_relevant_documents(query)
+            dense_retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
+            
+            # Create sparse retriever (BM25) with filtering if needed
+            if self.sparse_retriever is None:
+                # st.warning("BM25 retriever not initialized. Using dense retrieval only.")
+                top_k_docs = dense_retriever.get_relevant_documents(query)
+            else:
+                # Filter BM25 documents if PDF filter is specified
+                filtered_bm25_docs = self.bm25_documents
+                if pdf_filter:
+                    filtered_bm25_docs = [
+                        doc for doc in self.bm25_documents 
+                        if doc.metadata.get("pdf_name") == pdf_filter
+                    ]
+                
+                if not filtered_bm25_docs:
+                    st.warning(f"No documents found for PDF filter: {pdf_filter}")
+                    return []
+                
+                # Create filtered BM25 retriever
+                filtered_sparse_retriever = BM25Retriever.from_documents(filtered_bm25_docs)
+                filtered_sparse_retriever.k = k
+                
+                # Create ensemble retriever with weighted combination
+                ensemble_retriever = EnsembleRetriever(
+                    retrievers=[filtered_sparse_retriever, dense_retriever],
+                    weights=[0.6, 0.4]  # Favor sparse (BM25) over dense
+                )
+                
+                top_k_docs = ensemble_retriever.invoke(query)
             
             if not top_k_docs:
                 return []
             
             # Re-rank using cross-encoder
-            candidate_texts = [doc.page_content for doc in top_k_docs]
-            pairs = [(query, text) for text in candidate_texts]
+            pairs = [(query, doc.page_content) for doc in top_k_docs]
             scores = self.cross_encoder.predict(pairs)
             
             scored_docs = sorted(zip(top_k_docs, scores), key=lambda x: x[1], reverse=True)
@@ -484,7 +558,7 @@ class RAGPipeline:
             return ranked_docs
             
         except Exception as e:
-            st.error(f"Error in search and ranking: {e}")
+            st.error(f"Error in hybrid search and ranking: {e}")
             return []
     
     def generate_answer(self, query, ranked_docs, num_docs=2):
